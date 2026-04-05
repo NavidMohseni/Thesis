@@ -74,7 +74,7 @@ supervised_pca_cox <- function(Z, time, status, K,
 
     # Orthogonalize using QR decomposition to enforce U^T U = I
     qr_res <- qr(U_temp)
-    U <- qr.Q(qr_res)  # p x K, orthonormal columns
+    Q <- qr.Q(qr_res)  # p x K, orthonormal columns
     R <- qr.R(qr_res)  # K x K, upper triangular
 
     # Standardize the signs of Q (QR decomposition can arbitrarily flip signs between iterations)
@@ -149,3 +149,4 @@ results <- supervised_pca_cox(Z = Z_sim, time = time_sim, status = status_sim, K
 cat("\nFinal Estimated Alpha Weights:\n")
 print(results$alpha)
 cat("\nTrue Alpha Weights were: -1.5, 0.0, 2.0\n")
+
