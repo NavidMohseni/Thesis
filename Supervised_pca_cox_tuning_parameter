@@ -1,0 +1,213 @@
+# ==============================================================================
+# Collective Estimation Simulation with High-dim Scalar Data in Survival Analysis
+# ==============================================================================
+
+# Load necessary libraries
+library(survival)
+library(tidyverse)
+
+# ==============================================================================
+# PART 1: CORE ALGORITHM FUNCTION
+# ==============================================================================
+
+#' Supervised Dimension Reduction Cox Model
+#' 
+#' @param Z Numeric matrix of scalar covariates (n x p)
+#' @param time Numeric vector of survival times (n x 1)
+#' @param status Numeric vector of event indicators (n x 1) (1 for event, 0 for censoring)
+#' @param K Integer, number of latent dimensions to extract
+#' @param theta Numeric [0, 1], supervision weight (1 = Unsupervised PCA, 0 = Pure Cox)
+#' @param gamma Numeric, learning rate for Gradient Ascent on U
+#' @param max_iter Integer, maximum number of alternating optimization iterations
+#' @param tol Numeric, tolerance for convergence
+#' 
+#' @return A list containing the projection matrix U, survival weights alpha, 
+#'         the final Cox model object, and convergence details.
+supervised_pca_cox <- function(Z, time, status, K, theta = 0.5,
+                               gamma = 0.001, max_iter = 100, tol = 1e-4) {
+  
+  n <- nrow(Z)
+  p <- ncol(Z)
+  
+  # Center and scale the data for stable PCA and gradients
+  Z_scaled <- scale(Z, center = TRUE, scale = TRUE)
+  
+  # --- INITIALIZATION ---
+  # Initialize U using standard unsupervised PCA
+  svd_Z <- svd(Z_scaled)
+  U <- svd_Z$v[, 1:K, drop = FALSE]
+  
+  # Initialize sigma2 ONCE (Do not update in loop to maintain theta balance)
+  Z_recon <- Z_scaled %*% U %*% t(U)
+  sigma2 <- mean((Z_scaled - Z_recon)^2) 
+  
+  # Initialize alpha by fitting Cox model on the initial PCA scores
+  Z_proj <- Z_scaled %*% U 
+  df <- data.frame(time = time, status = status, Z_proj)
+  
+  # suppressWarnings prevents spam from the initial unoptimized fit
+  cox_init <- suppressWarnings(coxph(Surv(time, status) ~ ., data = df))
+  alpha <- matrix(coef(cox_init), ncol = 1) 
+  
+  # --- ALTERNATING OPTIMIZATION LOOP ---
+  for (iter in 1:max_iter) {
+    U_old <- U
+    alpha_old <- alpha
+    
+    # Block A: Update Alpha
+    Z_proj <- Z_scaled %*% U 
+    df <- data.frame(time = time, status = status, Z_proj)
+    cox_fit <- suppressWarnings(coxph(Surv(time, status) ~ ., data = df))
+    alpha <- matrix(coef(cox_fit), ncol = 1) 
+    
+    # Extract Martingale residuals
+    d <- matrix(residuals(cox_fit, type = "martingale"), ncol = 1)
+    
+    # Block B: Update U (Gradient Ascent)
+    # 1. Data Gradient (Weighted by theta)
+    G_data <- (1 / sigma2) * crossprod(Z_scaled) %*% U
+    
+    # 2. Cox Gradient (Weighted by 1 - theta)
+    G_cox <- crossprod(Z_scaled, d) %*% t(alpha)
+    
+    # 3. Total Weighted Gradient
+    G_total <- (theta * G_data) + ((1 - theta) * G_cox)
+    U_temp <- U + gamma * G_total
+    
+    # 4. Orthogonalize using QR decomposition
+    qr_res <- qr(U_temp)
+    Q <- qr.Q(qr_res)
+    R <- qr.R(qr_res)
+    
+    # Standardize the signs of Q to prevent false non-convergence
+    sign_diag <- sign(diag(R))
+    U <- scale(Q, center = FALSE, scale = sign_diag)
+    
+    # Block C: Check Convergence
+    diff_alpha <- max(abs(alpha - alpha_old))
+    diff_U <- max(abs(U - U_old))
+    
+    if (diff_alpha < tol && diff_U < tol) {
+      break
+    }
+  }
+  
+  return(list(
+    U = U,
+    alpha = alpha,
+    iterations = iter,
+    Z_proj = Z_scaled %*% U,
+    final_model = cox_fit
+  ))
+}
+
+# ==============================================================================
+# PART 2: SIMULATION SETUP
+# ==============================================================================
+set.seed(42)
+
+cat("Generating synthetic high-dimensional survival data...\n")
+
+n_sim <- 300 
+p_sim <- 50 
+K_sim <- 3 
+
+# 1. Generate True Matrix and Latent Scores
+U_true <- qr.Q(qr(matrix(rnorm(p_sim * K_sim), nrow = p_sim, ncol = K_sim)))
+C_scores <- matrix(rnorm(n_sim * K_sim), nrow = n_sim, ncol = K_sim)
+
+# 2. Generate Scalar Covariates Z with noise
+Z_raw <- C_scores %*% t(U_true) + matrix(rnorm(n_sim * p_sim, sd = 0.5), nrow = n_sim, ncol = p_sim)
+Z_sim <- scale(Z_raw, center = TRUE, scale = TRUE)
+
+# 3. Generate Survival Times
+alpha_true <- matrix(c(-1.5, 0, 2.0), ncol = 1) 
+eta_true <- Z_sim %*% U_true %*% alpha_true
+
+hazard <- exp(eta_true)
+time_sim <- rexp(n_sim, rate = hazard) 
+
+censor_time <- rexp(n_sim, rate = 0.5) 
+status_sim <- ifelse(time_sim <= censor_time, 1, 0) 
+time_sim <- pmin(time_sim, censor_time) 
+
+# ==============================================================================
+# PART 3: K-FOLD CROSS-VALIDATION FOR THETA
+# ==============================================================================
+cat("Starting K-Fold Cross Validation for optimal theta...\n")
+
+theta_grid <- seq(0.05, 1.0, by = 0.05)
+n_folds <- 5
+folds <- sample(rep(1:n_folds, length.out = n_sim))
+
+cv_results <- numeric(length(theta_grid))
+
+for (idx in seq_along(theta_grid)) {
+  current_theta <- theta_grid[idx]
+  c_indices <- numeric(n_folds)
+  
+  for (f in 1:n_folds) {
+    # Train/Test Split
+    test_idx <- which(folds == f)
+    Z_train <- Z_sim[-test_idx, ]
+    Y_train <- time_sim[-test_idx]
+    delta_train <- status_sim[-test_idx]
+    
+    Z_test <- Z_sim[test_idx, ]
+    Y_test <- time_sim[test_idx]
+    delta_test <- status_sim[test_idx]
+    
+    # Train Model
+    fit <- supervised_pca_cox(Z = Z_train, time = Y_train, status = delta_train, 
+                              K = K_sim, theta = current_theta, gamma = 0.001)
+    
+    # Predict on Test Set
+    eta_pred <- Z_test %*% fit$U %*% fit$alpha
+    
+    # Calculate raw Concordance Index
+    raw_c <- concordance(Surv(Y_test, delta_test) ~ eta_pred)$concordance
+    
+    # Apply the Hazard Direction Fix (Trap avoidance)
+    c_indices[f] <- ifelse(raw_c < 0.5, 1 - raw_c, raw_c)
+  }
+  
+  cv_results[idx] <- mean(c_indices)
+  cat(sprintf("Theta: %.2f | True Mean C-Index: %.4f\n", current_theta, cv_results[idx]))
+}
+
+# ==============================================================================
+# PART 4: FINAL OUTPUT AND GGPLOT
+# ==============================================================================
+optimal_theta <- theta_grid[which.max(cv_results)]
+cat(sprintf("\n=> Optimal Theta Found: %.2f\n", optimal_theta))
+
+cat("Fitting final model on the entire dataset using optimal theta...\n")
+final_model <- supervised_pca_cox(Z = Z_sim, time = time_sim, status = status_sim, 
+                                  K = K_sim, theta = optimal_theta, gamma = 0.001)
+
+# Calculate final estimated linear predictor
+eta_estimated <- Z_sim %*% final_model$U %*% final_model$alpha
+
+# Build a dataframe for ggplot
+plot_data <- tibble(
+  True_Risk = as.numeric(eta_true),
+  Estimated_Risk = as.numeric(eta_estimated)
+)
+
+# Create a publication-ready plot using ggplot2
+risk_plot <- ggplot(plot_data, aes(x = True_Risk, y = Estimated_Risk)) +
+  geom_point(alpha = 0.6, color = "#2c7fb8", size = 2) +
+  geom_smooth(method = "lm", color = "#de2d26", se = TRUE, fill = "#fcae91") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Supervised PCA Cox Model Validation",
+    subtitle = sprintf("True vs. Estimated Linear Predictors (Optimal Theta = %.2f)", optimal_theta),
+    x = "True Simulated Risk Score",
+    y = "Estimated Risk Score"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+print(risk_plot)
