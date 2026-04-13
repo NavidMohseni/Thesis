@@ -82,14 +82,31 @@ supervised_pca_cox <- function(Z, time, status, K, theta = 0.5,
     # Standardize the signs of Q to prevent false non-convergence
     sign_diag <- sign(diag(R))
     U <- scale(Q, center = FALSE, scale = sign_diag)
+
+    # 1. Data Likelihood: -1/(2*sigma^2) * ||Z - ZUU^T||^2
+    Z_recon_current <- Z_scaled %*% U %*% t(U)
+    l_data <- -(1 / (2 * sigma2)) * sum((Z_scaled - Z_recon_current)^2)
+    
+    # 2. Cox Likelihood (Extracted directly from the survival package fit)
+    l_cox <- cox_fit$loglik[2]
+    
+    # 3. Joint Likelihood
+    l_joint <- (theta * l_data) + ((1 - theta) * l_cox)
     
     # Block C: Check Convergence
     diff_alpha <- max(abs(alpha - alpha_old))
     diff_U <- max(abs(U - U_old))
     
+    if (iter %% 10 == 0 || iter == 1) {
+      cat(sprintf("Iter %3d: d_alpha = %.5f | d_U = %.5f | l_joint = %.2f\n", 
+                  iter, diff_alpha, diff_U, l_joint))
+    }
+    
     if (diff_alpha < tol && diff_U < tol) {
+      cat(sprintf("=> Converged successfully at iteration %d (l_joint = %.2f)\n", iter, l_joint))
       break
     }
+
   }
   
   return(list(
@@ -119,6 +136,9 @@ C_scores <- matrix(rnorm(n_sim * K_sim), nrow = n_sim, ncol = K_sim)
 # 2. Generate Scalar Covariates Z with noise
 Z_raw <- C_scores %*% t(U_true) + matrix(rnorm(n_sim * p_sim, sd = 0.5), nrow = n_sim, ncol = p_sim)
 Z_sim <- scale(Z_raw, center = TRUE, scale = TRUE)
+dim(Z_raw)
+dim(U_true)
+dim(C_scores)
 
 # 3. Generate Survival Times
 alpha_true <- matrix(c(-1.5, 0, 2.0), ncol = 1) 
