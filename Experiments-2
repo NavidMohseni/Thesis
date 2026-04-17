@@ -1,0 +1,381 @@
+# ==============================================================================
+# COMPARISON 1: Log-Likelihood Analysis
+# ==============================================================================
+
+# Extract log-likelihoods from current models
+ll_standard <- fit_standard$loglik[2]  
+ll_proposed <- fit_proposed$final_model$loglik[2]
+
+# Calculate AIC and BIC for comparison
+aic_standard <- AIC(fit_standard)
+aic_proposed <- AIC(fit_proposed$final_model)
+
+bic_standard <- BIC(fit_standard)
+bic_proposed <- BIC(fit_proposed$final_model)
+
+# Create comparison table
+ll_comparison <- tibble(
+  Model = c("Standard Cox (No Reduction)", "Supervised PCA Cox"),
+  `Log-Likelihood` = c(ll_standard, ll_proposed),
+  `Num Parameters` = c(p_sim, K_sim),
+  AIC = c(aic_standard, aic_proposed),
+  BIC = c(bic_standard, bic_proposed),
+  `Test C-Index` = c(c_std, c_prop)
+)
+
+print(ll_comparison)
+ll_diff <- ll_proposed - ll_standard
+
+
+
+# ==============================================================================
+# EXPERIMENT: Effect of Sample Size (n) on Model Performance
+# ==============================================================================
+
+set.seed(123)
+
+p_fixed <- 50
+K_fixed <- 3
+noise_fixed <- 0.8
+
+# Vary sample size
+n_values <- c(50, 100, 200, 400)
+
+results_n <- data.frame()
+
+cat("=== EXPERIMENT 1: Varying Sample Size (n) ===\n\n")
+
+for (n_val in n_values) {
+  cat(sprintf("Testing n = %d...\n", n_val))
+  
+  # Generate data
+  U_temp <- qr.Q(qr(matrix(rnorm(p_fixed * K_fixed), p_fixed, K_fixed)))
+  C_temp <- matrix(rnorm(n_val * K_fixed), n_val, K_fixed)
+  Z_temp_raw <- C_temp %*% t(U_temp) + matrix(rnorm(n_val * p_fixed, sd = noise_fixed), n_val, p_fixed)
+  Z_temp <- scale(Z_temp_raw, center = TRUE, scale = TRUE)
+  
+  alpha_temp <- matrix(c(-1.5, 0, 2.0), ncol = 1)
+  eta_temp <- Z_temp %*% U_temp %*% alpha_temp
+  time_temp <- rexp(n_val, rate = exp(eta_temp))
+  censor_temp <- rexp(n_val, rate = 0.5)
+  status_temp <- ifelse(time_temp <= censor_temp, 1, 0)
+  time_temp <- pmin(time_temp, censor_temp)
+  
+  # Split train/test
+  n_train_temp <- floor(n_val * 0.6)
+  train_idx_temp <- sample(1:n_val, n_train_temp)
+  
+  Z_train_temp <- Z_temp[train_idx_temp, ]
+  time_train_temp <- time_temp[train_idx_temp]
+  status_train_temp <- status_temp[train_idx_temp]
+  
+  Z_test_temp <- Z_temp[-train_idx_temp, ]
+  time_test_temp <- time_temp[-train_idx_temp]
+  status_test_temp <- status_temp[-train_idx_temp]
+  
+  # Fit Standard Cox (only if n > p)
+  if (n_train_temp > p_fixed) {
+    df_train_temp <- data.frame(time = time_train_temp, status = status_train_temp, Z_train_temp)
+    fit_std_temp <- tryCatch({
+      suppressWarnings(coxph(Surv(time, status) ~ ., data = df_train_temp))
+    }, error = function(e) NULL)
+    
+    if (!is.null(fit_std_temp)) {
+      df_test_temp <- data.frame(Z_test_temp)
+      colnames(df_test_temp) <- colnames(df_train_temp)[-c(1,2)]
+      eta_std_temp <- predict(fit_std_temp, newdata = df_test_temp)
+      c_std_temp <- concordance(Surv(time_test_temp, status_test_temp) ~ eta_std_temp)$concordance
+      c_std_temp <- ifelse(c_std_temp < 0.5, 1 - c_std_temp, c_std_temp)
+      ll_std_temp <- fit_std_temp$loglik[2]
+    } else {
+      c_std_temp <- NA
+      ll_std_temp <- NA
+    }
+  } else {
+    c_std_temp <- NA
+    ll_std_temp <- NA
+  }
+  
+  # Fit Proposed Model
+  fit_prop_temp <- suppressWarnings(
+    supervised_pca_cox_svd(Z = Z_train_temp, time = time_train_temp, 
+                           status = status_train_temp, K = K_fixed, 
+                           theta = 0.6, gamma = 0.001, max_iter = 100)
+  )
+  
+  eta_prop_temp <- Z_test_temp %*% fit_prop_temp$U %*% fit_prop_temp$alpha
+  c_prop_temp <- concordance(Surv(time_test_temp, status_test_temp) ~ eta_prop_temp)$concordance
+  c_prop_temp <- ifelse(c_prop_temp < 0.5, 1 - c_prop_temp, c_prop_temp)
+  ll_prop_temp <- fit_prop_temp$final_model$loglik[2]
+  
+  # Store results
+  results_n <- rbind(results_n, 
+    data.frame(n = n_val, Model = "Standard Cox", 
+               LogLik = ll_std_temp, C_Index = c_std_temp),
+    data.frame(n = n_val, Model = "Supervised PCA Cox", 
+               LogLik = ll_prop_temp, C_Index = c_prop_temp)
+  )
+}
+
+print(results_n)
+
+
+
+# ==============================================================================
+# EXPERIMENT 2: Effect of Dimensionality (p) on Model Performance
+# ==============================================================================
+
+set.seed(456)
+
+n_fixed <- 200
+K_fixed <- 3
+noise_fixed <- 0.8
+
+# Vary dimensionality
+p_values <- c(20, 50, 100, 200)
+
+results_p <- data.frame()
+
+cat("\n=== EXPERIMENT 2: Varying Dimensionality (p) ===\n\n")
+
+for (p_val in p_values) {
+  cat(sprintf("Testing p = %d...\n", p_val))
+  
+  # Generate data
+  U_temp <- qr.Q(qr(matrix(rnorm(p_val * K_fixed), p_val, K_fixed)))
+  C_temp <- matrix(rnorm(n_fixed * K_fixed), n_fixed, K_fixed)
+  Z_temp_raw <- C_temp %*% t(U_temp) + matrix(rnorm(n_fixed * p_val, sd = noise_fixed), n_fixed, p_val)
+  Z_temp <- scale(Z_temp_raw, center = TRUE, scale = TRUE)
+  
+  alpha_temp <- matrix(c(-1.5, 0, 2.0), ncol = 1)
+  eta_temp <- Z_temp %*% U_temp %*% alpha_temp
+  time_temp <- rexp(n_fixed, rate = exp(eta_temp))
+  censor_temp <- rexp(n_fixed, rate = 0.5)
+  status_temp <- ifelse(time_temp <= censor_temp, 1, 0)
+  time_temp <- pmin(time_temp, censor_temp)
+  
+  # Split train/test
+  n_train_temp <- 120
+  train_idx_temp <- sample(1:n_fixed, n_train_temp)
+  
+  Z_train_temp <- Z_temp[train_idx_temp, ]
+  time_train_temp <- time_temp[train_idx_temp]
+  status_train_temp <- status_temp[train_idx_temp]
+  
+  Z_test_temp <- Z_temp[-train_idx_temp, ]
+  time_test_temp <- time_temp[-train_idx_temp]
+  status_test_temp <- status_temp[-train_idx_temp]
+  
+  # Fit Standard Cox (only if n > p)
+  if (n_train_temp > p_val) {
+    df_train_temp <- data.frame(time = time_train_temp, status = status_train_temp, Z_train_temp)
+    fit_std_temp <- tryCatch({
+      suppressWarnings(coxph(Surv(time, status) ~ ., data = df_train_temp))
+    }, error = function(e) NULL)
+    
+    if (!is.null(fit_std_temp)) {
+      df_test_temp <- data.frame(Z_test_temp)
+      colnames(df_test_temp) <- colnames(df_train_temp)[-c(1,2)]
+      eta_std_temp <- predict(fit_std_temp, newdata = df_test_temp)
+      c_std_temp <- concordance(Surv(time_test_temp, status_test_temp) ~ eta_std_temp)$concordance
+      c_std_temp <- ifelse(c_std_temp < 0.5, 1 - c_std_temp, c_std_temp)
+      ll_std_temp <- fit_std_temp$loglik[2]
+    } else {
+      c_std_temp <- NA
+      ll_std_temp <- NA
+    }
+  } else {
+    c_std_temp <- NA
+    ll_std_temp <- NA
+  }
+  
+  # Fit Proposed Model
+  fit_prop_temp <- suppressWarnings(
+    supervised_pca_cox_svd(Z = Z_train_temp, time = time_train_temp, 
+                           status = status_train_temp, K = K_fixed, 
+                           theta = 0.6, gamma = 0.001, max_iter = 100)
+  )
+  
+  eta_prop_temp <- Z_test_temp %*% fit_prop_temp$U %*% fit_prop_temp$alpha
+  c_prop_temp <- concordance(Surv(time_test_temp, status_test_temp) ~ eta_prop_temp)$concordance
+  c_prop_temp <- ifelse(c_prop_temp < 0.5, 1 - c_prop_temp, c_prop_temp)
+  ll_prop_temp <- fit_prop_temp$final_model$loglik[2]
+  
+  # Store results
+  results_p <- rbind(results_p, 
+    data.frame(p = p_val, Model = "Standard Cox", 
+               LogLik = ll_std_temp, C_Index = c_std_temp),
+    data.frame(p = p_val, Model = "Supervised PCA Cox", 
+               LogLik = ll_prop_temp, C_Index = c_prop_temp)
+  )
+}
+
+print(results_p)
+
+
+# ==============================================================================
+# EXPERIMENT 3: Effect of Latent Dimensions (K) on Both Models
+# ==============================================================================
+
+set.seed(789)
+
+n_fixed <- 200
+p_fixed <- 50
+K_true <- 3
+noise_fixed <- 0.8
+
+# Generate shared data
+U_base <- qr.Q(qr(matrix(rnorm(p_fixed * K_true), p_fixed, K_true)))
+C_base <- matrix(rnorm(n_fixed * K_true), n_fixed, K_true)
+Z_base_raw <- C_base %*% t(U_base) + matrix(rnorm(n_fixed * p_fixed, sd = noise_fixed), n_fixed, p_fixed)
+Z_base <- scale(Z_base_raw, center = TRUE, scale = TRUE)
+
+alpha_base <- matrix(c(-1.5, 0, 2.0), ncol = 1)
+eta_base <- Z_base %*% U_base %*% alpha_base
+time_base <- rexp(n_fixed, rate = exp(eta_base))
+censor_base <- rexp(n_fixed, rate = 0.5)
+status_base <- ifelse(time_base <= censor_base, 1, 0)
+time_base <- pmin(time_base, censor_base)
+
+# Split train/test
+n_train_temp <- 120
+train_idx_base <- sample(1:n_fixed, n_train_temp)
+
+Z_train_base <- Z_base[train_idx_base, ]
+time_train_base <- time_base[train_idx_base]
+status_train_base <- status_base[train_idx_base]
+
+Z_test_base <- Z_base[-train_idx_base, ]
+time_test_base <- time_base[-train_idx_base]
+status_test_base <- status_base[-train_idx_base]
+
+# Vary K for the proposed model
+K_values <- c(2, 3, 5, 10)
+
+results_k <- data.frame()
+
+cat("\n=== EXPERIMENT 3: Varying Latent Dimensions (K) ===\n\n")
+
+# Standard Cox (constant across K)
+df_train_base <- data.frame(time = time_train_base, status = status_train_base, Z_train_base)
+fit_std_base <- suppressWarnings(coxph(Surv(time, status) ~ ., data = df_train_base))
+
+df_test_base <- data.frame(Z_test_base)
+colnames(df_test_base) <- colnames(df_train_base)[-c(1,2)]
+eta_std_base <- predict(fit_std_base, newdata = df_test_base)
+c_std_base <- concordance(Surv(time_test_base, status_test_base) ~ eta_std_base)$concordance
+c_std_base <- ifelse(c_std_base < 0.5, 1 - c_std_base, c_std_base)
+ll_std_base <- fit_std_base$loglik[2]
+
+for (K_val in K_values) {
+  cat(sprintf("Testing K = %d...\n", K_val))
+  
+  # Store standard cox result
+  results_k <- rbind(results_k,
+    data.frame(K = K_val, Model = "Standard Cox", 
+               LogLik = ll_std_base, C_Index = c_std_base,
+               Num_Params = p_fixed)
+  )
+  
+  # Fit Proposed Model with varying K
+  fit_prop_k <- suppressWarnings(
+    supervised_pca_cox_svd(Z = Z_train_base, time = time_train_base, 
+                           status = status_train_base, K = K_val, 
+                           theta = 0.6, gamma = 0.001, max_iter = 100)
+  )
+  
+  eta_prop_k <- Z_test_base %*% fit_prop_k$U %*% fit_prop_k$alpha
+  c_prop_k <- concordance(Surv(time_test_base, status_test_base) ~ eta_prop_k)$concordance
+  c_prop_k <- ifelse(c_prop_k < 0.5, 1 - c_prop_k, c_prop_k)
+  ll_prop_k <- fit_prop_k$final_model$loglik[2]
+  
+  results_k <- rbind(results_k,
+    data.frame(K = K_val, Model = "Supervised PCA Cox", 
+               LogLik = ll_prop_k, C_Index = c_prop_k,
+               Num_Params = K_val)
+  )
+}
+
+print(results_k)
+
+
+
+
+# ==============================================================================
+# VISUALIZATION: Comprehensive Model Comparison
+# ==============================================================================
+
+library(patchwork)
+
+# Plot 1: Effect of Sample Size (n)
+plot_n <- results_n |>
+  filter(!is.na(C_Index)) |>
+  ggplot(aes(x = n, y = C_Index, color = Model, shape = Model)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Standard Cox" = "#de2d26", 
+                                 "Supervised PCA Cox" = "#2c7fb8")) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "A. Impact of Sample Size (n)",
+    subtitle = "p = 50, K = 3",
+    x = "Sample Size (n)",
+    y = "Test C-Index"
+  ) +
+  theme(legend.position = "bottom")
+
+# Plot 2: Effect of Dimensionality (p)
+plot_p <- results_p |>
+  filter(!is.na(C_Index)) |>
+  ggplot(aes(x = p, y = C_Index, color = Model, shape = Model)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Standard Cox" = "#de2d26", 
+                                 "Supervised PCA Cox" = "#2c7fb8")) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "B. Impact of Dimensionality (p)",
+    subtitle = "n = 200, K = 3",
+    x = "Number of Variables (p)",
+    y = "Test C-Index"
+  ) +
+  theme(legend.position = "bottom")
+
+# Plot 3: Effect of Latent Dimensions (K)
+plot_k <- results_k |>
+  ggplot(aes(x = K, y = C_Index, color = Model, shape = Model)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Standard Cox" = "#de2d26", 
+                                 "Supervised PCA Cox" = "#2c7fb8")) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "C. Impact of Latent Dimensions (K)",
+    subtitle = "n = 200, p = 50",
+    x = "Latent Dimensions (K)",
+    y = "Test C-Index"
+  ) +
+  theme(legend.position = "bottom")
+
+# Plot 4: Log-Likelihood comparison across K
+plot_ll_k <- results_k |>
+  ggplot(aes(x = K, y = LogLik, color = Model, shape = Model)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Standard Cox" = "#de2d26", 
+                                 "Supervised PCA Cox" = "#2c7fb8")) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "D. Log-Likelihood vs K",
+    subtitle = "Standard Cox: 50 params, Proposed: K params",
+    x = "Latent Dimensions (K)",
+    y = "Log-Likelihood (Training)"
+  ) +
+  theme(legend.position = "bottom")
+
+# Combine all plots
+combined_plot <- (plot_n | plot_p) / (plot_k | plot_ll_k) +
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "bottom")
+
+print(combined_plot)
