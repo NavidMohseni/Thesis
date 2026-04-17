@@ -1,0 +1,500 @@
+# ==============================================================================
+# EXPERIMENT: The "No QR" Algorithm (Removing the Orthogonal Constraint)
+# ==============================================================================
+
+supervised_pca_cox_no_qr <- function(Z, time, status, K, theta = 0.5,
+                               gamma = 0.001, max_iter = 100, tol = 1e-4) {
+  
+  n <- nrow(Z)
+  p <- ncol(Z)
+  Z_scaled <- scale(Z, center = TRUE, scale = TRUE)
+  
+  svd_Z <- svd(Z_scaled)
+  U <- svd_Z$v[, 1:K, drop = FALSE]
+  
+  Z_recon <- Z_scaled %*% U %*% t(U)
+  sigma2 <- mean((Z_scaled - Z_recon)^2) 
+  
+  Z_proj <- Z_scaled %*% U 
+  df <- data.frame(time = time, status = status, Z_proj)
+  cox_init <- suppressWarnings(coxph(Surv(time, status) ~ ., data = df))
+  alpha <- matrix(coef(cox_init), ncol = 1) 
+  
+  cat("Starting unconstrained gradient ascent...\n")
+  
+  for (iter in 1:max_iter) {
+    U_old <- U
+    alpha_old <- alpha
+    
+    # Block A: Update Alpha
+    Z_proj <- Z_scaled %*% U 
+    df <- data.frame(time = time, status = status, Z_proj)
+    
+    # We use tryCatch because the Cox model might instantly crash if U explodes
+    cox_fit <- tryCatch({
+      suppressWarnings(coxph(Surv(time, status) ~ ., data = df))
+    }, error = function(e) {
+      return(NULL)
+    })
+    
+    if (is.null(cox_fit)) {
+      cat(sprintf("=> CRITICAL FAILURE: Cox model crashed at iteration %d due to infinite variance.\n", iter))
+      break
+    }
+    
+    alpha <- matrix(coef(cox_fit), ncol = 1) 
+    d <- matrix(residuals(cox_fit, type = "martingale"), ncol = 1)
+    
+    # Block B: Update U (Gradient Ascent)
+    G_data <- (1 / sigma2) * crossprod(Z_scaled) %*% U
+    G_cox <- crossprod(Z_scaled, d) %*% t(alpha)
+    G_total <- (theta * G_data) + ((1 - theta) * G_cox)
+    
+    # -> TAKE THE GRADIENT STEP
+    U_temp <- U + gamma * G_total
+    
+    # -> THE CRUCIAL DELETION: WE REMOVED THE QR DECOMPOSITION HERE
+    U <- U_temp 
+    
+    # --- SAFETY CATCH FOR EXPLOSIONS ---
+    if (any(is.na(U)) || any(is.infinite(U))) {
+      cat(sprintf("=> CRITICAL FAILURE: Matrix U exploded to NaN/Inf at iteration %d.\n", iter))
+      break
+    }
+
+    # Block C: Check Convergence
+    diff_alpha <- max(abs(alpha - alpha_old), na.rm = TRUE)
+    diff_U <- max(abs(U - U_old), na.rm = TRUE)
+    
+    if (iter %% 10 == 0 || iter == 1) {
+      cat(sprintf("Iter %3d: d_alpha = %.5f | d_U = %.5f\n", iter, diff_alpha, diff_U))
+    }
+    
+    if (diff_alpha < tol && diff_U < tol) {
+      cat(sprintf("=> Converged successfully at iteration %d\n", iter))
+      break
+    }
+  }
+  
+  return(list(U = U, alpha = alpha, iterations = iter))
+}
+
+cat("\n--- RUNNING THE NO-QR TEST ---\n")
+# Assuming Z_sim, time_sim, and status_sim are still in your environment from the previous script:
+failed_fit <- supervised_pca_cox_no_qr(Z = Z_sim, time = time_sim, status = status_sim, 
+                                       K = 3, theta = 0.6, gamma = 0.001)
+
+
+
+
+
+# ==============================================================================
+# EXPERIMENT: The SVD Algorithm (Replacing QR with SVD)
+# ==============================================================================
+
+supervised_pca_cox_svd <- function(Z, time, status, K, theta = 0.5,
+                                   gamma = 0.001, max_iter = 100, tol = 1e-4) {
+  
+  n <- nrow(Z)
+  p <- ncol(Z)
+  Z_scaled <- scale(Z, center = TRUE, scale = TRUE)
+  
+  # Initialization
+  svd_Z <- svd(Z_scaled)
+  U <- svd_Z$v[, 1:K, drop = FALSE]
+  
+  Z_recon <- Z_scaled %*% U %*% t(U)
+  sigma2 <- mean((Z_scaled - Z_recon)^2) 
+  
+  Z_proj <- Z_scaled %*% U 
+  df <- data.frame(time = time, status = status, Z_proj)
+  cox_init <- suppressWarnings(coxph(Surv(time, status) ~ ., data = df))
+  alpha <- matrix(coef(cox_init), ncol = 1) 
+  
+  for (iter in 1:max_iter) {
+    U_old <- U
+    alpha_old <- alpha
+    
+    # Block A: Update Alpha
+    Z_proj <- Z_scaled %*% U 
+    df <- data.frame(time = time, status = status, Z_proj)
+    cox_fit <- suppressWarnings(coxph(Surv(time, status) ~ ., data = df))
+    alpha <- matrix(coef(cox_fit), ncol = 1) 
+    d <- matrix(residuals(cox_fit, type = "martingale"), ncol = 1)
+    
+    # Block B: Update U (Gradient Ascent)
+    G_data <- (1 / sigma2) * crossprod(Z_scaled) %*% U
+    G_cox <- crossprod(Z_scaled, d) %*% t(alpha)
+    G_total <- (theta * G_data) + ((1 - theta) * G_cox)
+    U_temp <- U + gamma * G_total
+    
+    # -> THE ADVISOR'S SUGGESTION: SVD INSTEAD OF QR
+    svd_res <- svd(U_temp)
+    U <- svd_res$u
+    
+    # Block C: Check Convergence
+    diff_alpha <- max(abs(alpha - alpha_old))
+    diff_U <- max(abs(U - U_old))
+    
+    if (diff_alpha < tol && diff_U < tol) {
+      break
+    }
+  }
+  
+  return(list(U = U, alpha = alpha, iterations = iter, final_model = cox_fit))
+}                                       
+
+
+# ==============================================================================
+# Comparing: QR vs. SVD
+# ==============================================================================
+
+cat("--- RACING QR vs. SVD HEAD-TO-HEAD ---\n\n")
+
+# Set up a strict train/test split so both see the exact same data
+set.seed(999)
+train_idx <- sample(1:nrow(Z_sim), size = 200)
+Z_train <- Z_sim[train_idx, ]
+time_train <- time_sim[train_idx]
+status_train <- status_sim[train_idx]
+
+Z_test <- Z_sim[-train_idx, ]
+time_test <- time_sim[-train_idx]
+status_test <- status_sim[-train_idx]
+
+# ---------------------------------------------------------
+# 1. Test the QR Method (Your Original Method)
+# ---------------------------------------------------------
+cat("1. Running QR Decomposition Method...\n")
+time_qr <- system.time({
+  fit_qr <- supervised_pca_cox(Z = Z_train, time = time_train, status = status_train, 
+                               K = 3, theta = 0.6, gamma = 0.001)
+})
+
+# Predict and get C-Index
+eta_qr <- Z_test %*% fit_qr$U %*% fit_qr$alpha
+c_index_qr <- concordance(Surv(time_test, status_test) ~ eta_qr)$concordance
+c_index_qr <- ifelse(c_index_qr < 0.5, 1 - c_index_qr, c_index_qr)
+
+
+# ---------------------------------------------------------
+# 2. Test the SVD Method
+# ---------------------------------------------------------
+cat("2. Running SVD Method...\n")
+time_svd <- system.time({
+  fit_svd <- supervised_pca_cox_svd(Z = Z_train, time = time_train, status = status_train, 
+                                    K = 3, theta = 0.6, gamma = 0.001)
+})
+
+# Predict and get C-Index
+eta_svd <- Z_test %*% fit_svd$U %*% fit_svd$alpha
+c_index_svd <- concordance(Surv(time_test, status_test) ~ eta_svd)$concordance
+c_index_svd <- ifelse(c_index_svd < 0.5, 1 - c_index_svd, c_index_svd)
+
+
+# ---------------------------------------------------------
+# 3. Print the Final Comparison
+# ---------------------------------------------------------
+cat("\n================ RESULTS ================\n")
+cat(sprintf("QR Method  | C-Index: %.5f | Iters: %3d | Time: %.3f seconds\n", 
+            c_index_qr, fit_qr$iterations, time_qr["elapsed"]))
+cat(sprintf("SVD Method | C-Index: %.5f | Iters: %3d | Time: %.3f seconds\n", 
+            c_index_svd, fit_svd$iterations, time_svd["elapsed"]))
+cat("=========================================\n")
+
+
+
+# ==============================================================================
+# PARAMETER EXPLORATION: Comparing True vs. Estimated Matrices
+# ==============================================================================
+
+U_est <- fit_svd$U
+alpha_est <- fit_svd$alpha
+
+# ---------------------------------------------------------
+# 1. Comparing the Final Risk Vectors (U * alpha)
+# ---------------------------------------------------------
+Ua_true <- as.vector(U_true %*% alpha_true)
+Ua_est  <- as.vector(U_est %*% alpha_est)
+
+# Metric: Cosine Similarity
+# Measures the angle between the two vectors (1 = perfect alignment, -1 = perfect opposite)
+cos_sim <- sum(Ua_true * Ua_est) / (sqrt(sum(Ua_true^2)) * sqrt(sum(Ua_est^2)))
+
+# ---------------------------------------------------------
+# 2. Comparing the U Matrices (Subspace Distance)
+# ---------------------------------------------------------
+# Trap Avoidance: We CANNOT compare U directly. We must compare their Projections (UU^T)
+# This tests if the two "rooms" occupy the exact same physical space, regardless of spin.
+Proj_true <- U_true %*% t(U_true)
+Proj_est  <- U_est %*% t(U_est)
+
+# Metric: Frobenius Norm Distance
+# Measures how far apart the two subspaces are (0 = perfectly identical spaces)
+subspace_dist <- norm(Proj_true - Proj_est, type = "F")
+
+cat("\n--- PARAMETER COMPARISON RESULTS ---\n")
+cat(sprintf("1. Cosine Similarity of (U * alpha): %.4f\n", cos_sim))
+cat(sprintf("2. Subspace Distance between U matrices: %.4f\n", subspace_dist))
+
+# ---------------------------------------------------------
+# 3. Visual Confirmation of U * alpha
+# ---------------------------------------------------------
+library(ggplot2)
+param_df <- data.frame(
+  True_Vector = Ua_true,
+  Est_Vector = Ua_est
+)
+
+vector_plot <- ggplot(param_df, aes(x = True_Vector, y = Est_Vector)) +
+  geom_point(color = "#2c7fb8", size = 3, alpha = 0.7) +
+  geom_smooth(method = "lm", color = "black", linetype = "dashed", se = FALSE) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Parameter Alignment: True vs. Estimated (U * alpha)",
+    subtitle = sprintf("Cosine Similarity: %.4f | Vectors align almost perfectly.", cos_sim),
+    x = "True Biological Vector Coefficients",
+    y = "Estimated Vector Coefficients"
+  )
+
+print(vector_plot)
+
+
+
+
+
+
+# ==============================================================================
+# COMPARISON: Standard Cox (No Reduction) vs. Supervised PCA Cox (SVD)
+# ==============================================================================
+
+library(survival)
+library(tidyverse)
+library(patchwork)
+
+# ------------------------------------------------------------------------------
+# 1. SIMULATION SETUP (Train / Test Split)
+# ------------------------------------------------------------------------------
+set.seed(123)
+
+n_train <- 150  
+n_test <- 300   
+p_sim <- 50     
+K_sim <- 3 
+noise_sd <- 0.8
+
+# True parameters
+U_true <- qr.Q(qr(matrix(rnorm(p_sim * K_sim), nrow = p_sim, ncol = K_sim)))
+alpha_true <- matrix(c(-1.5, 0, 2.0), ncol = 1) 
+
+# Generate Train Data
+C_train <- matrix(rnorm(n_train * K_sim), nrow = n_train, ncol = K_sim)
+Z_train_raw <- C_train %*% t(U_true) + matrix(rnorm(n_train * p_sim, sd = noise_sd), n_train, p_sim)
+Z_train <- scale(Z_train_raw, center = TRUE, scale = TRUE)
+
+eta_train_true <- Z_train %*% U_true %*% alpha_true
+time_train <- rexp(n_train, rate = exp(eta_train_true))
+censor_train <- rexp(n_train, rate = 0.5)
+status_train <- ifelse(time_train <= censor_train, 1, 0)
+time_train <- pmin(time_train, censor_train)
+
+# Generate Test Data
+C_test <- matrix(rnorm(n_test * K_sim), nrow = n_test, ncol = K_sim)
+Z_test_raw <- C_test %*% t(U_true) + matrix(rnorm(n_test * p_sim, sd = noise_sd), n_test, p_sim)
+Z_test <- scale(Z_test_raw, 
+                center = attr(Z_train, "scaled:center"), 
+                scale = attr(Z_train, "scaled:scale"))
+
+eta_test_true <- Z_test %*% U_true %*% alpha_true
+time_test <- rexp(n_test, rate = exp(eta_test_true))
+censor_test <- rexp(n_test, rate = 0.5)
+status_test <- ifelse(time_test <= censor_test, 1, 0)
+time_test <- pmin(time_test, censor_test)
+
+# ------------------------------------------------------------------------------
+# 2. FIT THE THREE MODELS
+# ------------------------------------------------------------------------------
+cat("\n=== FITTING MODELS ===\n")
+
+# Model 1: Standard Cox (No Dimension Reduction)
+cat("1. Standard Cox (All", p_sim, "variables, no reduction)...\n")
+df_train_std <- data.frame(time = time_train, status = status_train, Z_train)
+fit_standard <- suppressWarnings(coxph(Surv(time, status) ~ ., data = df_train_std))
+
+# Model 2: Proposed Supervised PCA Cox with SVD
+cat("2. Supervised PCA Cox with SVD (K=3)...\n")
+fit_proposed <- supervised_pca_cox_svd(
+  Z = Z_train, 
+  time = time_train, 
+  status = status_train, 
+  K = K_sim, 
+  theta = 0.6, 
+  gamma = 0.001
+)
+
+# ------------------------------------------------------------------------------
+# 3. PREDICTIVE PERFORMANCE (C-INDEX)
+# ------------------------------------------------------------------------------
+cat("\n=== PREDICTIVE PERFORMANCE ===\n")
+
+# Standard Cox predictions
+df_test_std <- data.frame(Z_test)
+colnames(df_test_std) <- colnames(df_train_std)[-c(1,2)]
+eta_std_est <- predict(fit_standard, newdata = df_test_std)
+c_std <- concordance(Surv(time_test, status_test) ~ eta_std_est)$concordance
+c_std <- ifelse(c_std < 0.5, 1 - c_std, c_std)
+
+# Proposed model predictions
+eta_prop_est <- Z_test %*% fit_proposed$U %*% fit_proposed$alpha
+c_prop <- concordance(Surv(time_test, status_test) ~ eta_prop_est)$concordance
+c_prop <- ifelse(c_prop < 0.5, 1 - c_prop, c_prop)
+
+# True risk C-index
+c_true <- concordance(Surv(time_test, status_test) ~ eta_test_true)$concordance
+c_true <- ifelse(c_true < 0.5, 1 - c_true, c_true)
+
+cat(sprintf("True Risk C-Index:      %.4f\n", c_true))
+cat(sprintf("Standard Cox C-Index:   %.4f\n", c_std))
+cat(sprintf("Proposed Model C-Index: %.4f\n", c_prop))
+
+# ------------------------------------------------------------------------------
+# 4. SURVIVAL CURVE COMPARISON FOR REPRESENTATIVE PATIENTS
+# ------------------------------------------------------------------------------
+cat("\n=== GENERATING SURVIVAL CURVES ===\n")
+
+# Select 3 representative patients: low, medium, high risk
+quantiles <- quantile(eta_test_true, probs = c(0.25, 0.5, 0.75))
+patient_indices <- sapply(quantiles, function(q) which.min(abs(eta_test_true - q)))
+
+t_seq <- seq(0, max(time_test), length.out = 200)
+
+# Function to create survival data for one patient
+create_survival_data <- function(patient_idx, risk_group) {
+  
+  # 1. TRUE SURVIVAL CURVE (smooth exponential)
+  surv_true <- exp(-exp(eta_test_true[patient_idx]) * t_seq)
+  df_true <- tibble(
+    Time = t_seq, 
+    Survival = surv_true, 
+    Model = "True",
+    Patient = risk_group
+  )
+  
+  # 2. STANDARD COX CURVE
+  patient_std_data <- df_test_std[patient_idx, , drop = FALSE]
+  surv_std_obj <- survfit(fit_standard, newdata = patient_std_data)
+  df_std <- tibble(
+    Time = surv_std_obj$time, 
+    Survival = surv_std_obj$surv, 
+    Model = "Standard Cox (No Reduction)",
+    Patient = risk_group
+  )
+  
+  # 3. PROPOSED MODEL CURVE
+  Z_test_proj <- Z_test %*% fit_proposed$U
+  df_test_proj <- as.data.frame(Z_test_proj)
+  colnames(df_test_proj) <- names(coef(fit_proposed$final_model))
+  patient_prop_data <- df_test_proj[patient_idx, , drop = FALSE]
+  
+  surv_prop_obj <- survfit(fit_proposed$final_model, newdata = patient_prop_data)
+  df_prop <- tibble(
+    Time = surv_prop_obj$time, 
+    Survival = surv_prop_obj$surv, 
+    Model = "Supervised PCA Cox (SVD)",
+    Patient = risk_group
+  )
+  
+  bind_rows(df_true, df_std, df_prop)
+}
+
+# Create data for all three patients
+df_all <- bind_rows(
+  create_survival_data(patient_indices[1], "Low Risk (25th percentile)"),
+  create_survival_data(patient_indices[2], "Medium Risk (50th percentile)"),
+  create_survival_data(patient_indices[3], "High Risk (75th percentile)")
+)
+
+# ------------------------------------------------------------------------------
+# 5. VISUALIZATION
+# ------------------------------------------------------------------------------
+
+# Plot 1: Survival curves for three risk groups
+surv_plot <- ggplot(df_all, aes(x = Time, y = Survival, color = Model, linetype = Model)) +
+  geom_line(data = filter(df_all, Model == "True"), linewidth = 1.2) +
+  geom_step(data = filter(df_all, Model != "True"), size = 0.9) +
+  facet_wrap(~Patient, ncol = 1) +
+  scale_color_manual(values = c("True" = "black", 
+                                 "Standard Cox (No Reduction)" = "#de2d26", 
+                                 "Supervised PCA Cox (SVD)" = "#2c7fb8")) +
+  scale_linetype_manual(values = c("True" = "dashed", 
+                                    "Standard Cox (No Reduction)" = "solid", 
+                                    "Supervised PCA Cox (SVD)" = "solid")) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Survival Curve Comparison: Standard Cox vs. Supervised PCA Cox",
+    subtitle = sprintf("C-Index | Standard: %.3f | Proposed: %.3f", c_std, c_prop),
+    x = "Time",
+    y = "Survival Probability S(t)",
+    color = "Model:",
+    linetype = "Model:"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom",
+    legend.box = "vertical"
+  )
+
+# Plot 2: Risk score comparison
+risk_comparison <- tibble(
+  True_Risk = as.numeric(eta_test_true),
+  Standard_Cox = as.numeric(eta_std_est),
+  Proposed_Model = as.numeric(eta_prop_est)
+) |>
+  pivot_longer(cols = c(Standard_Cox, Proposed_Model), 
+               names_to = "Method", 
+               values_to = "Estimated_Risk")
+
+risk_plot <- ggplot(risk_comparison, aes(x = True_Risk, y = Estimated_Risk, color = Method)) +
+  geom_point(alpha = 0.5, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("Standard_Cox" = "#de2d26", 
+                                 "Proposed_Model" = "#2c7fb8"),
+                     labels = c("Standard Cox", "Supervised PCA Cox")) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Risk Score Alignment: True vs. Estimated",
+    x = "True Risk Score",
+    y = "Estimated Risk Score",
+    color = "Method:"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+# Display plots
+print(surv_plot)
+print(risk_plot)
+
+# Combined plot
+combined_plot <- surv_plot / risk_plot + 
+  plot_layout(heights = c(2, 1))
+
+print(combined_plot)
+
+# ------------------------------------------------------------------------------
+# 6. SUMMARY TABLE
+# ------------------------------------------------------------------------------
+summary_table <- tibble(
+  Metric = c("C-Index", "Number of Parameters", "Converged Iterations"),
+  `Standard Cox` = c(sprintf("%.4f", c_std), 
+                     as.character(p_sim), 
+                     "N/A"),
+  `Supervised PCA Cox` = c(sprintf("%.4f", c_prop), 
+                           as.character(K_sim), 
+                           as.character(fit_proposed$iterations))
+)
+
+cat("\n=== SUMMARY TABLE ===\n")
+print(summary_table)
