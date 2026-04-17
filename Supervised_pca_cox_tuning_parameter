@@ -231,3 +231,169 @@ risk_plot <- ggplot(plot_data, aes(x = True_Risk, y = Estimated_Risk)) +
   )
 
 print(risk_plot)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================================================================
+# The SVD Algorithm (Replacing QR with SVD)
+# ==============================================================================
+supervised_pca_cox_svd <- function(Z, time, status, K, theta = 0.5,
+                                   gamma = 0.001, max_iter = 100, tol = 1e-4) {
+  
+  n <- nrow(Z)
+  p <- ncol(Z)
+  Z_scaled <- scale(Z, center = TRUE, scale = TRUE)
+  
+  # Initialization
+  svd_Z <- svd(Z_scaled)
+  U <- svd_Z$v[, 1:K, drop = FALSE]
+  
+  Z_recon <- Z_scaled %*% U %*% t(U)
+  sigma2 <- mean((Z_scaled - Z_recon)^2) 
+  
+  Z_proj <- Z_scaled %*% U 
+  df <- data.frame(time = time, status = status, Z_proj)
+  cox_init <- suppressWarnings(coxph(Surv(time, status) ~ ., data = df))
+  alpha <- matrix(coef(cox_init), ncol = 1) 
+  
+  for (iter in 1:max_iter) {
+    U_old <- U
+    alpha_old <- alpha
+    
+    # Block A: Update Alpha
+    Z_proj <- Z_scaled %*% U 
+    df <- data.frame(time = time, status = status, Z_proj)
+    cox_fit <- suppressWarnings(coxph(Surv(time, status) ~ ., data = df))
+    alpha <- matrix(coef(cox_fit), ncol = 1) 
+    d <- matrix(residuals(cox_fit, type = "martingale"), ncol = 1)
+    
+    # Block B: Update U (Gradient Ascent)
+    G_data <- (1 / sigma2) * crossprod(Z_scaled) %*% U
+    G_cox <- crossprod(Z_scaled, d) %*% t(alpha)
+    G_total <- (theta * G_data) + ((1 - theta) * G_cox)
+    U_temp <- U + gamma * G_total
+    
+    # SVD INSTEAD OF QR
+    svd_res <- svd(U_temp)
+    U <- svd_res$u
+    
+    # Block C: Check Convergence
+    diff_alpha <- max(abs(alpha - alpha_old))
+    diff_U <- max(abs(U - U_old))
+    
+    if (diff_alpha < tol && diff_U < tol) {
+      break
+    }
+  }
+  
+  return(list(
+    U = U, 
+    alpha = alpha, 
+    iterations = iter, 
+    final_model = cox_fit))
+}                                       
+
+# ------------------------------------------------------------------------------
+# PART 2: SIMULATION SETUP
+# ------------------------------------------------------------------------------
+set.seed(42)
+cat("Generating synthetic high-dimensional survival data...\n")
+
+n_sim <- 300 
+p_sim <- 50 
+K_sim <- 3 
+
+U_true <- qr.Q(qr(matrix(rnorm(p_sim * K_sim), nrow = p_sim, ncol = K_sim)))
+C_scores <- matrix(rnorm(n_sim * K_sim), nrow = n_sim, ncol = K_sim)
+
+Z_raw <- C_scores %*% t(U_true) + matrix(rnorm(n_sim * p_sim, sd = 0.5), nrow = n_sim, ncol = p_sim)
+Z_sim <- scale(Z_raw, center = TRUE, scale = TRUE)
+
+alpha_true <- matrix(c(-1.5, 0, 2.0), ncol = 1) 
+eta_true <- Z_sim %*% U_true %*% alpha_true
+hazard <- exp(eta_true)
+time_sim <- rexp(n_sim, rate = hazard) 
+
+censor_time <- rexp(n_sim, rate = 0.5) 
+status_sim <- ifelse(time_sim <= censor_time, 1, 0) 
+time_sim <- pmin(time_sim, censor_time) 
+
+# ------------------------------------------------------------------------------
+# PART 3: K-FOLD CROSS-VALIDATION
+# ------------------------------------------------------------------------------
+cat("Starting K-Fold Cross Validation for optimal theta...\n")
+
+theta_grid <- seq(0.05, 1.0, by = 0.05)
+n_folds <- 5
+folds <- sample(rep(1:n_folds, length.out = n_sim))
+cv_results <- numeric(length(theta_grid))
+
+for (idx in seq_along(theta_grid)) {
+  current_theta <- theta_grid[idx]
+  c_indices <- numeric(n_folds)
+  
+  for (f in 1:n_folds) {
+    test_idx <- which(folds == f)
+    Z_train <- Z_sim[-test_idx, ]
+    Y_train <- time_sim[-test_idx]
+    delta_train <- status_sim[-test_idx]
+    
+    Z_test <- Z_sim[test_idx, ]
+    Y_test <- time_sim[test_idx]
+    delta_test <- status_sim[test_idx]
+    
+    fit <- supervised_pca_cox_svd(Z = Z_train, time = Y_train, status = delta_train, 
+                                  K = K_sim, theta = current_theta, gamma = 0.001)
+    
+    eta_pred <- Z_test %*% fit$U %*% fit$alpha
+    raw_c <- concordance(Surv(Y_test, delta_test) ~ eta_pred)$concordance
+    c_indices[f] <- ifelse(raw_c < 0.5, 1 - raw_c, raw_c)
+  }
+  cv_results[idx] <- mean(c_indices)
+  cat(sprintf("Theta: %.2f | Mean C-Index: %.4f\n", current_theta, cv_results[idx]))
+}
+
+optimal_theta <- theta_grid[which.max(cv_results)]
+cat(sprintf("\n=> Optimal Theta Found: %.2f\n", optimal_theta))
+
+final_model <- supervised_pca_cox_svd(Z = Z_sim, time = time_sim, status = status_sim, 
+                                      K = K_sim, theta = optimal_theta, gamma = 0.001)
+
+eta_estimated <- Z_sim %*% final_model$U %*% final_model$alpha
+
+# Build a dataframe for ggplot
+plot_data <- tibble(
+  True_Risk = as.numeric(eta_true),
+  Estimated_Risk = as.numeric(eta_estimated)
+)
+
+# Create a publication-ready plot using ggplot2
+risk_plot <- ggplot(plot_data, aes(x = True_Risk, y = Estimated_Risk)) +
+  geom_point(alpha = 0.6, color = "#2c7fb8", size = 2) +
+  geom_smooth(method = "lm", color = "#de2d26", se = TRUE, fill = "#fcae91") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Supervised PCA Cox Model Validation",
+    subtitle = sprintf("True vs. Estimated Linear Predictors (Optimal Theta = %.2f)", optimal_theta),
+    x = "True Simulated Risk Score",
+    y = "Estimated Risk Score"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+print(risk_plot)
+
+        
